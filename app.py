@@ -12,6 +12,96 @@ def get_db_connection():
     conn.row_factory = sqlite3.Row
     return conn
 
+# ===== FUNCIONES AUXILIARES DE CONTABILIDAD =====
+def crear_asiento_venta(factura_id):
+    """Crea los asientos contables para una venta"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        # Obtener datos de la factura
+        factura = cur.execute("""
+            SELECT numero, fecha, total 
+            FROM facturas 
+            WHERE id = ?
+        """, (factura_id,)).fetchone()
+        
+        if not factura:
+            return
+        
+        fecha = factura["fecha"]
+        total = factura["total"]
+        descripcion = f"Venta factura #{factura['numero']}"
+        
+        # Obtener IDs de cuentas (asumiendo que ya existen en PUC)
+        caja_id = cur.execute("SELECT id FROM puc WHERE codigo = '1105'").fetchone()
+        ventas_id = cur.execute("SELECT id FROM puc WHERE codigo = '4135'").fetchone()
+        
+        if caja_id and ventas_id:
+            # Débito a Caja
+            cur.execute("""
+                INSERT INTO movimientos_contables (fecha, cuenta_id, descripcion, debito, credito, modulo, referencia_id)
+                VALUES (?, ?, ?, ?, 0, 'ventas', ?)
+            """, (fecha, caja_id["id"], descripcion, total, factura_id))
+            
+            # Crédito a Ventas
+            cur.execute("""
+                INSERT INTO movimientos_contables (fecha, cuenta_id, descripcion, debito, credito, modulo, referencia_id)
+                VALUES (?, ?, ?, 0, ?, 'ventas', ?)
+            """, (fecha, ventas_id["id"], descripcion, total, factura_id))
+        
+        conn.commit()
+        conn.close()
+        
+    except Exception as e:
+        print(f"Error creando asiento de venta: {e}")
+
+def crear_asiento_compra(compra_id):
+    """Crea los asientos contables para una compra"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        # Obtener datos de la compra
+        compra = cur.execute("""
+            SELECT numero, fecha, total, forma_pago 
+            FROM compras 
+            WHERE id = ?
+        """, (compra_id,)).fetchone()
+        
+        if not compra:
+            return
+        
+        fecha = compra["fecha"]
+        total = compra["total"]
+        descripcion = f"Compra #{compra['numero']}"
+        
+        # Obtener IDs de cuentas
+        inventario_id = cur.execute("SELECT id FROM puc WHERE codigo = '1435'").fetchone()
+        
+        if compra["forma_pago"] == "contado":
+            cuenta_pago_id = cur.execute("SELECT id FROM puc WHERE codigo = '1105'").fetchone()  # Caja
+        else:
+            cuenta_pago_id = cur.execute("SELECT id FROM puc WHERE codigo = '2205'").fetchone()  # Proveedores
+        
+        if inventario_id and cuenta_pago_id:
+            # Débito a Inventario
+            cur.execute("""
+                INSERT INTO movimientos_contables (fecha, cuenta_id, descripcion, debito, credito, modulo, referencia_id)
+                VALUES (?, ?, ?, ?, 0, 'compras', ?)
+            """, (fecha, inventario_id["id"], descripcion, total, compra_id))
+            
+            # Crédito a Caja o Proveedores
+            cur.execute("""
+                INSERT INTO movimientos_contables (fecha, cuenta_id, descripcion, debito, credito, modulo, referencia_id)
+                VALUES (?, ?, ?, 0, ?, 'compras', ?)
+            """, (fecha, cuenta_pago_id["id"], descripcion, total, compra_id))
+        
+        conn.commit()
+        conn.close()
+        
+    except Exception as e:
+        print(f"Error creando asiento de compra: {e}")
 
 # ===== LOGIN =====
 @app.route("/login", methods=["GET", "POST"])
@@ -103,6 +193,9 @@ def facturacion_save():
 
         conn.commit()
         conn.close()
+
+        # Crear asiento contable
+        crear_asiento_venta(factura_id)
 
         return jsonify({"success": True, "factura_num": factura_num})
 
@@ -197,6 +290,9 @@ def compras_save():
 
         conn.commit()
         conn.close()
+
+        # Crear asiento contable
+        crear_asiento_compra(compra_id)
 
         return jsonify({"success": True, "compra_num": numero})
 
@@ -355,6 +451,198 @@ def gastos():
     if "user" not in session:
         return redirect(url_for("login"))
     return render_template("gastos.html", user=session["user"])
+
+
+# ===== MÓDULO DE CONTABILIDAD =====
+@app.route("/contabilidad")
+def contabilidad():
+    if "user" not in session:
+        return redirect(url_for("login"))
+    return render_template("contabilidad.html", user=session["user"])
+
+@app.route("/contabilidad/puc")
+def puc():
+    if "user" not in session:
+        return redirect(url_for("login"))
+    
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cuentas = cur.execute("""
+        SELECT codigo, nombre, tipo 
+        FROM puc 
+        ORDER BY codigo
+    """).fetchall()
+    conn.close()
+    
+    return render_template("puc.html", user=session["user"], cuentas=cuentas)
+
+@app.route("/contabilidad/movimientos")
+def movimientos():
+    if "user" not in session:
+        return redirect(url_for("login"))
+    
+    today = datetime.now().strftime("%Y-%m-%d")
+    first_day_month = datetime.now().replace(day=1).strftime("%Y-%m-%d")
+    
+    return render_template("movimientos.html", 
+                         user=session["user"],
+                         fecha_inicio=first_day_month,
+                         fecha_fin=today)
+
+@app.route("/api/puc/add", methods=["POST"])
+def add_cuenta():
+    if "user" not in session:
+        return jsonify({"success": False, "error": "No autorizado"})
+    
+    data = request.get_json()
+    try:
+        codigo = data.get("codigo", "").strip()
+        nombre = data.get("nombre", "").strip()
+        tipo = data.get("tipo", "").strip()
+        
+        if not all([codigo, nombre, tipo]):
+            return jsonify({"success": False, "error": "Todos los campos son obligatorios"})
+        
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO puc (codigo, nombre, tipo) 
+            VALUES (?, ?, ?)
+        """, (codigo, nombre, tipo))
+        conn.commit()
+        conn.close()
+        
+        return jsonify({"success": True, "mensaje": f"Cuenta {codigo} agregada correctamente"})
+        
+    except sqlite3.IntegrityError:
+        return jsonify({"success": False, "error": "El código de cuenta ya existe"})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)})
+
+@app.route("/api/movimientos", methods=["POST"])
+def get_movimientos():
+    if "user" not in session:
+        return jsonify({"success": False, "error": "No autorizado"})
+    
+    data = request.get_json()
+    fecha_inicio = data.get("fecha_inicio")
+    fecha_fin = data.get("fecha_fin")
+    
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        movimientos = cur.execute("""
+            SELECT m.fecha, m.descripcion, p.codigo, p.nombre, 
+                   m.debito, m.credito, m.modulo, m.referencia_id
+            FROM movimientos_contables m
+            JOIN puc p ON m.cuenta_id = p.id
+            WHERE m.fecha BETWEEN ? AND ?
+            ORDER BY m.fecha DESC, m.id DESC
+        """, (fecha_inicio, fecha_fin)).fetchall()
+        
+        conn.close()
+        
+        return jsonify({
+            "success": True,
+            "movimientos": [dict(row) for row in movimientos]
+        })
+        
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)})
+
+@app.route("/api/balance", methods=["POST"])
+def get_balance():
+    if "user" not in session:
+        return jsonify({"success": False, "error": "No autorizado"})
+    
+    data = request.get_json()
+    fecha_fin = data.get("fecha_fin")
+    
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        balance = cur.execute("""
+            SELECT p.codigo, p.nombre, p.tipo,
+                   SUM(m.debito) as total_debito,
+                   SUM(m.credito) as total_credito,
+                   CASE 
+                       WHEN p.tipo IN ('activo', 'gasto') THEN SUM(m.debito) - SUM(m.credito)
+                       ELSE SUM(m.credito) - SUM(m.debito)
+                   END as saldo
+            FROM puc p
+            LEFT JOIN movimientos_contables m ON p.id = m.cuenta_id AND m.fecha <= ?
+            GROUP BY p.id, p.codigo, p.nombre, p.tipo
+            HAVING SUM(COALESCE(m.debito, 0)) > 0 OR SUM(COALESCE(m.credito, 0)) > 0
+            ORDER BY p.codigo
+        """, (fecha_fin,)).fetchall()
+        
+        conn.close()
+        
+        return jsonify({
+            "success": True,
+            "balance": [dict(row) for row in balance]
+        })
+        
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)})
+
+@app.route("/api/puc/seed", methods=["POST"])
+def seed_puc():
+    """Inicializa el PUC con cuentas básicas"""
+    if "user" not in session:
+        return jsonify({"success": False, "error": "No autorizado"})
+    
+    cuentas_basicas = [
+        # ACTIVOS
+        ("1105", "Caja", "activo"),
+        ("1110", "Bancos", "activo"),
+        ("1305", "Clientes", "activo"),
+        ("1435", "Inventario de Mercancías", "activo"),
+        ("1540", "Equipo de Oficina", "activo"),
+        
+        # PASIVOS
+        ("2205", "Proveedores", "pasivo"),
+        ("2365", "Retención en la Fuente", "pasivo"),
+        ("2404", "IVA por Pagar", "pasivo"),
+        
+        # PATRIMONIO
+        ("3105", "Capital Social", "patrimonio"),
+        ("3605", "Utilidades Retenidas", "patrimonio"),
+        
+        # INGRESOS
+        ("4135", "Comercio al por Mayor y al Detal", "ingreso"),
+        ("4175", "Devoluciones en Ventas", "ingreso"),
+        
+        # GASTOS
+        ("5105", "Gastos de Personal", "gasto"),
+        ("5135", "Servicios", "gasto"),
+        ("5140", "Gastos Legales", "gasto"),
+        ("5195", "Diversos", "gasto"),
+        ("6135", "Comercio al por Mayor y al Detal", "gasto"),  # Costo de ventas
+    ]
+    
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        for codigo, nombre, tipo in cuentas_basicas:
+            try:
+                cur.execute("""
+                    INSERT OR IGNORE INTO puc (codigo, nombre, tipo) 
+                    VALUES (?, ?, ?)
+                """, (codigo, nombre, tipo))
+            except:
+                continue
+        
+        conn.commit()
+        conn.close()
+        
+        return jsonify({"success": True, "mensaje": "PUC inicializado correctamente"})
+        
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)})
 
 
 # ===== RESÚMENES Y REPORTES =====
